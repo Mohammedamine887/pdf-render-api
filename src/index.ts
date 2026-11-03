@@ -4,9 +4,8 @@ import cors from 'cors';
 import helmet from 'helmet';
 import { eq } from 'drizzle-orm';
 import { db } from './db/index.js';
-import { apiKeysTable } from './db/schema.js';
+import { apiKeysTable ,usersTable } from './db/schema.js';
 import * as dotenv from 'dotenv';
-
 dotenv.config();
 
 const app = express();
@@ -64,7 +63,55 @@ async function verifyApiKey(req: AuthenticatedRequest, res: Response, next: Next
     res.status(500).json({ error: 'Internal Server Error during authentication.' });
   }
 }
+// Public Signup / API Key Generation Endpoint
+app.post('/v1/auth/signup', async (req: Request, res: Response): Promise<void> => {
+  const { email } = req.body;
 
+  if (!email || !email.includes('@')) {
+    res.status(400).json({ error: 'Valid email is required.' });
+    return;
+  }
+
+  try {
+    // 1. Check if user already exists, or create a new one
+    let [user] = await db
+      .select()
+      .from(usersTable)
+      .where(eq(usersTable.email, email))
+      .limit(1);
+
+    if (!user) {
+      const [newUser] = await db
+        .insert(usersTable)
+        .values({ email })
+        .returning();
+      user = newUser;
+    }
+
+    // 2. Generate a unique live API key
+    const rawKey = `pp_live_${Math.random().toString(36).substring(2, 15)}${Math.random().toString(36).substring(2, 15)}`;
+
+    const [newApiKey] = await db
+      .insert(apiKeysTable)
+      .values({
+        userId: user.id,
+        key: rawKey,
+        name: 'Default Live Key',
+        isActive: true
+      })
+      .returning();
+
+    res.status(201).json({
+      message: 'API key generated successfully!',
+      email: user.email,
+      apiKey: newApiKey.key, // Shown only once upon creation
+      createdAt: newApiKey.createdAt
+    });
+  } catch (error: any) {
+    console.error('Signup Error:', error);
+    res.status(500).json({ error: 'Failed to generate API key', details: error.message });
+  }
+});
 // Protected PDF Generation Endpoint
 app.post('/v1/render/pdf', verifyApiKey, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const { html, format = 'A4', printBackground = true } = req.body;
