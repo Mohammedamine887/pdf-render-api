@@ -2,7 +2,7 @@ import express from 'express';
 import { chromium } from 'playwright';
 import cors from 'cors';
 import helmet from 'helmet';
-import { eq } from 'drizzle-orm';
+import { eq, and } from 'drizzle-orm';
 import { db } from './db/index.js';
 import { apiKeysTable, usersTable } from './db/schema.js';
 import * as dotenv from 'dotenv';
@@ -49,7 +49,7 @@ async function verifyApiKey(req, res, next) {
         res.status(500).json({ error: 'Internal Server Error during authentication.' });
     }
 }
-// Public Signup / API Key Generation Endpoint
+// Smart Signup / Key Recovery Endpoint
 app.post('/v1/auth/signup', async (req, res) => {
     const { email } = req.body;
     if (!email || !email.includes('@')) {
@@ -57,7 +57,7 @@ app.post('/v1/auth/signup', async (req, res) => {
         return;
     }
     try {
-        // 1. Check if user already exists, or create a new one
+        // 1. Find or create user
         let [user] = await db
             .select()
             .from(usersTable)
@@ -70,7 +70,24 @@ app.post('/v1/auth/signup', async (req, res) => {
                 .returning();
             user = newUser;
         }
-        // 2. Generate a unique live API key
+        // 2. Check if an active API key already exists for this user
+        let [existingKey] = await db
+            .select()
+            .from(apiKeysTable)
+            .where(and(eq(apiKeysTable.userId, user.id), eq(apiKeysTable.isActive, true)))
+            .limit(1);
+        if (existingKey) {
+            // Returning user: safely return their existing key
+            res.status(200).json({
+                message: 'Existing API key retrieved successfully!',
+                email: user.email,
+                apiKey: existingKey.key,
+                createdAt: existingKey.createdAt,
+                isNew: false
+            });
+            return;
+        }
+        // 3. New user: generate a fresh live API key
         const rawKey = `pp_live_${Math.random().toString(36).substring(2, 15)}${Math.random().toString(36).substring(2, 15)}`;
         const [newApiKey] = await db
             .insert(apiKeysTable)
@@ -82,15 +99,16 @@ app.post('/v1/auth/signup', async (req, res) => {
         })
             .returning();
         res.status(201).json({
-            message: 'API key generated successfully!',
+            message: 'New API key generated successfully!',
             email: user.email,
-            apiKey: newApiKey.key, // Shown only once upon creation
-            createdAt: newApiKey.createdAt
+            apiKey: newApiKey.key,
+            createdAt: newApiKey.createdAt,
+            isNew: true
         });
     }
     catch (error) {
-        console.error('Signup Error:', error);
-        res.status(500).json({ error: 'Failed to generate API key', details: error.message });
+        console.error('Signup/Recovery Error:', error);
+        res.status(500).json({ error: 'Failed to process request', details: error.message });
     }
 });
 // Protected PDF Generation Endpoint
