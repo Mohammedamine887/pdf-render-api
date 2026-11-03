@@ -3,8 +3,8 @@ import { chromium, Browser } from 'playwright';
 import cors from 'cors';
 import helmet from 'helmet';
 import { eq } from 'drizzle-orm';
-import { db } from './db';
-import { apiKeysTable } from './db/schema';
+import { db } from './db/index.js';
+import { apiKeysTable } from './db/schema.js';
 import * as dotenv from 'dotenv';
 
 dotenv.config();

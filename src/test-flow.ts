@@ -1,5 +1,5 @@
-import { db } from './db';
-import { usersTable, apiKeysTable } from './db/schema';
+import { db } from './db/index.js';
+import { usersTable, apiKeysTable } from './db/schema.js';
 import { chromium } from 'playwright';
 import * as dotenv from 'dotenv';
 import { eq } from 'drizzle-orm';
@@ -10,19 +10,16 @@ async function runLocalTest() {
   console.log('🔍 Starting dynamic local integration test...\n');
 
   try {
-    // 1. Check if ANY API key exists in Supabase, or create a test one automatically
     console.log('1️⃣ Checking Supabase database for an active API key...');
     let [existingKey] = await db.select().from(apiKeysTable).limit(1);
 
     if (!existingKey) {
       console.log('⚠️ No API keys found in Supabase. Creating a test user and key automatically...');
       
-      // Insert a test user
       const [newUser] = await db.insert(usersTable).values({
         email: `test_${Date.now()}@example.com`
       }).returning();
 
-      // Generate a dynamic test key
       const generatedKey = `pp_live_${Math.random().toString(36).substring(2, 15)}`;
       
       const [newKey] = await db.insert(apiKeysTable).values({
@@ -38,7 +35,6 @@ async function runLocalTest() {
       console.log(`✅ Found existing API key in database: ${existingKey.key}`);
     }
 
-    // 2. Test Playwright PDF Generation
     console.log('\n2️⃣ Launching headless Chromium browser via Playwright...');
     const browser = await chromium.launch({
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
