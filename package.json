@@ -19,12 +19,14 @@
     "express": "^5.3.0",
     "helmet": "^8.3.0",
     "playwright": "^1.64.1",
-    "postgres": "^4.0.0"
+    "postgres": "^4.0.0",
+    "stripe": "^23.1.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^26.6.6",
+    "@types/stripe": "^8.0.416",
     "drizzle-kit": "^0.31.11",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",

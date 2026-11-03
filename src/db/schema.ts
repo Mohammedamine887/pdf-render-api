@@ -10,9 +10,7 @@ import {
 
 export const usersTable = pgTable('users', {
   id: uuid('id').defaultRandom().primaryKey(),
-
   email: text('email').notNull().unique(),
-
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -32,7 +30,14 @@ export const apiKeysTable = pgTable('api_keys', {
 
   usageCount: integer('usage_count').default(0).notNull(),
 
-  monthlyLimit: integer('monthly_limit').default(100).notNull(),
+  monthlyLimit: integer('monthly_limit').default(50).notNull(),
+
+  // Subscription Tier ('free', 'pro', 'scale')
+  tier: text('tier').default('free').notNull(),
+
+  // Lemon Squeezy Tracking Metadata
+  lemonCustomerId: text('lemon_customer_id'),
+  lemonSubscriptionId: text('lemon_subscription_id'),
 
   usageResetAt: timestamp('usage_reset_at')
     .defaultNow()

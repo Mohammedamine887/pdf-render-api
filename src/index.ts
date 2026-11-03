@@ -2,6 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import { chromium, Browser } from 'playwright';
 import cors from 'cors';
 import helmet from 'helmet';
+import crypto from 'crypto';
 import { eq, and } from 'drizzle-orm';
 import { db } from './db/index.js';
 import { apiKeysTable, usersTable } from './db/schema.js';
@@ -20,16 +21,192 @@ app.use(cors({
     'https://page-to-paper-api.lovable.app'
   ],
   methods: ['POST', 'GET', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Signature']
 }));
 
-app.use(express.json({ limit: '10mb' }));
+// ==========================================
+// LEMON SQUEEZY WEBHOOK ENDPOINT
+// IMPORTANT: Register BEFORE express.json()
+// ==========================================
 
-let browser: Browser;
+app.post(
+  '/v1/billing/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req: Request, res: Response): Promise<void> => {
+    const signatureHeader = req.headers['x-signature'];
+    const secret = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET;
+
+    const signature = Array.isArray(signatureHeader)
+      ? signatureHeader[0]
+      : signatureHeader;
+
+    if (!signature || !secret) {
+      res.status(400).json({
+        error: 'Missing signature or webhook secret.'
+      });
+      return;
+    }
+
+    try {
+      const rawBody = req.body;
+
+      if (!Buffer.isBuffer(rawBody)) {
+        res.status(400).json({
+          error: 'Expected a raw JSON request body.'
+        });
+        return;
+      }
+
+      // 1. Verify HMAC SHA-256 signature.
+      if (!/^[a-fA-F0-9]{64}$/.test(signature)) {
+        res.status(401).json({
+          error: 'Invalid signature.'
+        });
+        return;
+      }
+
+      const expectedSignature = crypto
+        .createHmac('sha256', secret)
+        .update(rawBody)
+        .digest();
+
+      const receivedSignature = Buffer.from(signature, 'hex');
+
+      if (
+        receivedSignature.length !== expectedSignature.length ||
+        !crypto.timingSafeEqual(expectedSignature, receivedSignature)
+      ) {
+        res.status(401).json({
+          error: 'Invalid signature.'
+        });
+        return;
+      }
+
+      // 2. Parse verified payload.
+      const event = JSON.parse(rawBody.toString('utf8'));
+
+      const eventName = event.meta?.event_name;
+      const customData = event.meta?.custom_data;
+      const attributes = event.data?.attributes;
+
+      console.log(`Lemon Squeezy event received: ${eventName}`);
+
+      // 3. Subscription created, updated, or resumed.
+      if (
+        eventName === 'subscription_created' ||
+        eventName === 'subscription_updated' ||
+        eventName === 'subscription_resumed'
+      ) {
+        const apiKey = customData?.api_key;
+        const variantId = attributes?.variant_id?.toString();
+        const status = attributes?.status;
+        const subscriptionId = event.data?.id?.toString();
+        const customerId = attributes?.customer_id?.toString();
+
+        if (!apiKey || !variantId || !subscriptionId) {
+          res.status(400).json({
+            error: 'Missing API key, variant ID, or subscription ID.'
+          });
+          return;
+        }
+
+        if (status === 'active') {
+          const proVariantId = process.env.LEMON_PRO_VARIANT_ID;
+          const scaleVariantId = process.env.LEMON_SCALE_VARIANT_ID;
+
+          let tier: 'pro' | 'scale';
+          let monthlyLimit: number;
+
+          if (proVariantId && variantId === proVariantId) {
+            tier = 'pro';
+            monthlyLimit = 5000;
+          } else if (scaleVariantId && variantId === scaleVariantId) {
+            tier = 'scale';
+            monthlyLimit = 25000;
+          } else {
+            console.warn(`Unknown Lemon Squeezy variant: ${variantId}`);
+
+            res.status(400).json({
+              error: 'Unrecognized subscription variant.'
+            });
+            return;
+          }
+
+          const updatedKeys = await db
+            .update(apiKeysTable)
+            .set({
+              tier,
+              monthlyLimit,
+              lemonCustomerId: customerId ?? null,
+              lemonSubscriptionId: subscriptionId
+            })
+            .where(eq(apiKeysTable.key, apiKey))
+            .returning({ id: apiKeysTable.id });
+
+          if (updatedKeys.length === 0) {
+            res.status(404).json({
+              error: 'API key not found.'
+            });
+            return;
+          }
+
+          console.log(
+            `API key upgraded to ${tier.toUpperCase()} (${monthlyLimit} PDFs/month).`
+          );
+        }
+      }
+
+      // 4. Subscription cancelled or expired.
+      if (
+        eventName === 'subscription_cancelled' ||
+        eventName === 'subscription_expired'
+      ) {
+        const subscriptionId = event.data?.id?.toString();
+
+        if (subscriptionId) {
+          await db
+            .update(apiKeysTable)
+            .set({
+              tier: 'free',
+              monthlyLimit: 100,
+              lemonSubscriptionId: null
+            })
+            .where(
+              eq(apiKeysTable.lemonSubscriptionId, subscriptionId)
+            );
+
+          console.log(
+            `Subscription ${subscriptionId} ended. API key returned to Free tier.`
+          );
+        }
+      }
+
+      res.status(200).json({
+        received: true
+      });
+
+    } catch (error: unknown) {
+      console.error('Lemon Squeezy webhook error:', error);
+
+      res.status(500).json({
+        error: 'Webhook processing failed.'
+      });
+    }
+  }
+);
+
+// ==========================================
+// NORMAL JSON BODY MIDDLEWARE
+// Must come AFTER the webhook route
+// ==========================================
+
+app.use(express.json({ limit: '10mb' }));
 
 // ==========================================
 // PLAYWRIGHT BROWSER INITIALIZATION
 // ==========================================
+
+let browser: Browser;
 
 async function initBrowser(): Promise<void> {
   browser = await chromium.launch({
@@ -41,11 +218,12 @@ async function initBrowser(): Promise<void> {
     ]
   });
 
-  console.log('⚡ Playwright Chromium instance initialized');
+  console.log('Playwright Chromium instance initialized');
 }
 
 // ==========================================
-// AUTHENTICATION TYPES (userId is a UUID string)
+// AUTHENTICATION TYPES
+// userId is a UUID string
 // ==========================================
 
 export interface AuthenticatedRequest extends Request {
@@ -87,7 +265,6 @@ async function verifyApiKey(
       return;
     }
 
-    // Attach API key information to request
     req.userId = foundKey.userId;
     req.apiKeyRecord = foundKey;
 
@@ -109,7 +286,6 @@ async function verifyApiKey(
 app.post(
   '/v1/auth/signup',
   async (req: Request, res: Response): Promise<void> => {
-
     const { email } = req.body;
 
     if (!email || typeof email !== 'string' || !email.includes('@')) {
@@ -120,7 +296,7 @@ app.post(
     }
 
     try {
-      // 1. Find or create user
+      // 1. Find or create user.
       let [user] = await db
         .select()
         .from(usersTable)
@@ -136,7 +312,7 @@ app.post(
         user = newUser;
       }
 
-      // 2. Check for existing active API key
+      // 2. Find existing active API key.
       let [existingKey] = await db
         .select()
         .from(apiKeysTable)
@@ -156,15 +332,15 @@ app.post(
           createdAt: existingKey.createdAt,
           usageCount: existingKey.usageCount,
           monthlyLimit: existingKey.monthlyLimit,
+          tier: existingKey.tier,
           isNew: false
         });
 
         return;
       }
 
-      // 3. Generate a new API key
-      const rawKey =
-        `pp_live_${Math.random().toString(36).substring(2, 15)}${Math.random().toString(36).substring(2, 15)}`;
+      // 3. Generate a new API key.
+      const rawKey = `pp_live_${crypto.randomBytes(24).toString('hex')}`;
 
       const [newApiKey] = await db
         .insert(apiKeysTable)
@@ -183,6 +359,7 @@ app.post(
         createdAt: newApiKey.createdAt,
         usageCount: newApiKey.usageCount,
         monthlyLimit: newApiKey.monthlyLimit,
+        tier: newApiKey.tier,
         isNew: true
       });
 
@@ -209,19 +386,30 @@ app.get(
   async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
       const apiKeyRecord = req.apiKeyRecord;
+
       if (!apiKeyRecord) {
-        res.status(401).json({ error: 'Unauthorized' });
+        res.status(401).json({
+          error: 'Unauthorized'
+        });
         return;
       }
 
       res.status(200).json({
         usageCount: apiKeyRecord.usageCount,
         monthlyLimit: apiKeyRecord.monthlyLimit,
-        remaining: Math.max(0, apiKeyRecord.monthlyLimit - apiKeyRecord.usageCount),
-        tier: 'Free Tier'
+        remaining: Math.max(
+          0,
+          apiKeyRecord.monthlyLimit - apiKeyRecord.usageCount
+        ),
+        tier: apiKeyRecord.tier
       });
+
     } catch (error: unknown) {
-      res.status(500).json({ error: 'Failed to fetch usage stats' });
+      console.error('Usage Error:', error);
+
+      res.status(500).json({
+        error: 'Failed to fetch usage stats'
+      });
     }
   }
 );
@@ -237,7 +425,6 @@ app.post(
     req: AuthenticatedRequest,
     res: Response
   ): Promise<void> => {
-
     const {
       html,
       format = 'A4',
@@ -245,7 +432,7 @@ app.post(
       printBackground = true
     } = req.body;
 
-    // Validate HTML
+    // Validate HTML.
     if (!html || typeof html !== 'string') {
       res.status(400).json({
         error: 'Missing required "html" string in request body.'
@@ -253,7 +440,6 @@ app.post(
       return;
     }
 
-    // Retrieve authenticated API key
     const apiKeyRecord = req.apiKeyRecord;
 
     if (!apiKeyRecord) {
@@ -263,16 +449,14 @@ app.post(
       return;
     }
 
-    // ======================================
-    // 1. CHECK MONTHLY API QUOTA
-    // ======================================
-
+    // 1. Check monthly API quota.
     if (apiKeyRecord.usageCount >= apiKeyRecord.monthlyLimit) {
       res.status(429).json({
         error: 'Monthly API quota exceeded',
-        message: `You have used ${apiKeyRecord.usageCount}/${apiKeyRecord.monthlyLimit} free PDFs this month. Please upgrade your plan to continue.`,
+        message: `You have used ${apiKeyRecord.usageCount}/${apiKeyRecord.monthlyLimit} PDFs this month. Please upgrade your plan to continue.`,
         usageCount: apiKeyRecord.usageCount,
-        monthlyLimit: apiKeyRecord.monthlyLimit
+        monthlyLimit: apiKeyRecord.monthlyLimit,
+        tier: apiKeyRecord.tier
       });
 
       return;
@@ -281,10 +465,7 @@ app.post(
     let context;
 
     try {
-      // ======================================
-      // 2. GENERATE PDF USING PLAYWRIGHT
-      // ======================================
-
+      // 2. Generate PDF using Playwright.
       context = await browser.newContext();
 
       const page = await context.newPage();
@@ -306,10 +487,7 @@ app.post(
         }
       });
 
-      // ======================================
-      // 3. INCREMENT USAGE AFTER SUCCESS
-      // ======================================
-
+      // 3. Increment usage after successful generation.
       await db
         .update(apiKeysTable)
         .set({
@@ -321,12 +499,8 @@ app.post(
         `PDF generated successfully. Usage: ${apiKeyRecord.usageCount + 1}/${apiKeyRecord.monthlyLimit}`
       );
 
-      // ======================================
-      // 4. RETURN PDF TO CLIENT
-      // ======================================
-
+      // 4. Return PDF to client.
       res.contentType('application/pdf');
-
       res.send(pdfBuffer);
 
     } catch (error: unknown) {
@@ -371,7 +545,7 @@ app.listen(PORT, async () => {
     await initBrowser();
 
     console.log(
-      `🚀 API Server ready on http://localhost:${PORT}`
+      `API Server ready on http://localhost:${PORT}`
     );
 
   } catch (error) {
